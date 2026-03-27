@@ -6,18 +6,26 @@ You will be given:
 
 Your job is to produce a precise, structured problem definition.
 
-CRITICAL RULES — you must follow these exactly:
+CRITICAL RULES — follow these exactly:
 - target_column MUST be copied EXACTLY from the column names list below.
-  Do not invent, rename, or guess a column name. If you are unsure, pick
-  the column that most logically represents the outcome to predict.
+  Do not invent, rename, or guess a column name.
 - task_type must reflect the nature of the target variable.
 - success_metric must match the task type:
-    binary_classification   -> roc_auc or f1
+    binary_classification    -> roc_auc or f1
     multiclass_classification -> f1_weighted or accuracy
-    regression              -> rmse or mae
+    regression               -> rmse or mae
 - features_to_exclude should include ID columns or leakage-prone columns.
 - limitations must be non-empty and specific to THIS dataset and brief.
 - out_of_scope should state what this analysis will NOT address.
+
+MODEL RECOMMENDATION — pick one based on these guidelines:
+  logistic_regression  — use when: need interpretability, dataset > 50k rows,
+                         expect linear relationships, binary/multiclass task
+  random_forest        — use when: likely non-linear relationships, mixed
+                         feature types, medium dataset (1k-100k rows)
+  gradient_boosting    — use when: accuracy is the priority, dataset has
+                         class imbalance, medium dataset, non-linear problem
+  ridge                — use when: regression task, features may be correlated
 
 Business brief:
 {business_brief}

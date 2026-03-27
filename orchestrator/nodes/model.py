@@ -3,21 +3,20 @@ nodes/model.py
 --------------
 Node 4: Baseline Model
 
-Trains the baseline model, runs cross-validation, computes feature
-importances via coefficient magnitude AND SHAP values, and serialises
-everything with joblib.
+Trains the algorithm recommended by the scoping node, runs
+cross-validation, computes SHAP values, and serialises everything.
 
-Why SHAP?
-  Coefficients from LogisticRegression give a rough importance ranking
-  but they depend on feature scale. SHAP (SHapley Additive exPlanations)
-  gives theoretically grounded, model-agnostic importance values that
-  account for feature interactions. LinearExplainer is fast and exact
-  for linear models — no sampling required.
+Supported algorithms (driven by scoped_problem.model_recommendation):
+  logistic_regression  -> LogisticRegression (linear, interpretable)
+  random_forest        -> RandomForestClassifier / RandomForestRegressor
+  gradient_boosting    -> GradientBoostingClassifier / GradientBoostingRegressor
+  ridge                -> Ridge (regression only)
 
-Feature name cleaning:
-  sklearn's ColumnTransformer prefixes output columns with the
-  transformer name (e.g. "numeric__age"). We strip this prefix so
-  the dashboard and reports show clean column names.
+Why keep the LLM recommendation but execute deterministically?
+  The LLM picks the strategy from a controlled vocabulary based on the
+  brief and data profile. Deterministic code executes it. This gives
+  the system genuine adaptability without LLM hallucination risk in
+  the actual training code.
 """
 
 import json
@@ -27,18 +26,16 @@ import joblib
 import numpy as np
 import pandas as pd
 from rich.console import Console
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import (
-    f1_score,
-    mean_squared_error,
-    roc_auc_score,
-)
+from sklearn.metrics import f1_score, mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
-from sklearn.pipeline import Pipeline
 
 from orchestrator.config import settings
 from orchestrator.state import (
     AnalyticsState,
+    ModelRecommendation,
     ModelResults,
     TaskType,
 )
@@ -50,29 +47,89 @@ N_CV_FOLDS = 5
 
 
 # ---------------------------------------------------------------------------
-# Algorithm factory
+# Algorithm factory — expanded
 # ---------------------------------------------------------------------------
 
-def _get_algorithm(task_type: TaskType):
-    if task_type == TaskType.BINARY_CLASSIFICATION:
+def _get_algorithm(task_type: TaskType, recommendation: ModelRecommendation):
+    """
+    Return the appropriate sklearn estimator based on task type and
+    the LLM's model recommendation.
+
+    The recommendation comes from scoped_problem.model_recommendation —
+    the scoping LLM picked it from a controlled enum. We map it to a
+    real sklearn estimator here. The LLM never writes ML code.
+
+    Class imbalance handling:
+      LogisticRegression and RandomForest support class_weight='balanced'.
+      GradientBoosting does not — it handles imbalance via its loss function.
+    """
+    is_classification = "classification" in task_type.value
+    is_binary = task_type == TaskType.BINARY_CLASSIFICATION
+
+    if recommendation == ModelRecommendation.LOGISTIC_REGRESSION:
+        if not is_classification:
+            console.print(
+                "  [yellow]Note: logistic_regression recommended for regression "
+                "task — falling back to Ridge.[/yellow]"
+            )
+            return Ridge(alpha=1.0, random_state=RANDOM_STATE)
         return LogisticRegression(
             class_weight="balanced",
             max_iter=1000,
             random_state=RANDOM_STATE,
             solver="lbfgs",
         )
-    elif task_type == TaskType.MULTICLASS_CLASSIFICATION:
-        return LogisticRegression(
-            class_weight="balanced",
-            multi_class="multinomial",
-            max_iter=1000,
+
+    elif recommendation == ModelRecommendation.RANDOM_FOREST:
+        if is_classification:
+            return RandomForestClassifier(
+                n_estimators=200,
+                class_weight="balanced",
+                max_depth=8,
+                min_samples_leaf=20,
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+            )
+        return RandomForestRegressor(
+            n_estimators=200,
+            max_depth=8,
+            min_samples_leaf=20,
             random_state=RANDOM_STATE,
-            solver="lbfgs",
+            n_jobs=-1,
         )
-    elif task_type == TaskType.REGRESSION:
+
+    elif recommendation == ModelRecommendation.GRADIENT_BOOSTING:
+        if is_classification:
+            return GradientBoostingClassifier(
+                n_estimators=200,
+                learning_rate=0.05,
+                max_depth=4,
+                subsample=0.8,
+                random_state=RANDOM_STATE,
+            )
+        return GradientBoostingRegressor(
+            n_estimators=200,
+            learning_rate=0.05,
+            max_depth=4,
+            subsample=0.8,
+            random_state=RANDOM_STATE,
+        )
+
+    elif recommendation == ModelRecommendation.RIDGE:
+        if is_classification:
+            console.print(
+                "  [yellow]Note: ridge recommended for classification task "
+                "— falling back to LogisticRegression.[/yellow]"
+            )
+            return LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                random_state=RANDOM_STATE,
+            )
         return Ridge(alpha=1.0, random_state=RANDOM_STATE)
+
     else:
-        raise ValueError(f"Unsupported task type: {task_type}")
+        raise ValueError(f"Unknown model recommendation: {recommendation}")
 
 
 def _get_cv_scorer(task_type: TaskType) -> str:
@@ -82,13 +139,14 @@ def _get_cv_scorer(task_type: TaskType) -> str:
         return "f1_weighted"
     elif task_type == TaskType.REGRESSION:
         return "neg_root_mean_squared_error"
-    else:
-        raise ValueError(f"No scorer for: {task_type}")
+    raise ValueError(f"No scorer for: {task_type}")
 
 
 def _get_cv_splitter(task_type: TaskType, n_splits: int):
     if "classification" in task_type.value:
-        return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+        return StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE
+        )
     return KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
 
 
@@ -97,44 +155,37 @@ def _get_cv_splitter(task_type: TaskType, n_splits: int):
 # ---------------------------------------------------------------------------
 
 def _clean_feature_names(feature_names: list[str]) -> list[str]:
-    """
-    Strip sklearn ColumnTransformer prefixes from feature names.
-
-    sklearn's ColumnTransformer produces names like:
-      "numeric__age"         -> "age"
-      "categorical__gender"  -> "gender"
-
-    We strip everything up to and including the first "__" so the
-    dashboard and reports show the original column names.
-    """
-    cleaned = []
-    for name in feature_names:
-        if "__" in name:
-            cleaned.append(name.split("__", 1)[1])
-        else:
-            cleaned.append(name)
-    return cleaned
+    """Strip sklearn ColumnTransformer prefixes (numeric__, categorical__)."""
+    return [
+        name.split("__", 1)[1] if "__" in name else name
+        for name in feature_names
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Feature importances (coefficient-based)
+# Feature importances
 # ---------------------------------------------------------------------------
 
 def _extract_feature_importances(
-    model,
-    feature_names: list[str],
-    task_type: TaskType,
-    top_n: int = 10,
+    model, feature_names: list[str], task_type: TaskType, top_n: int = 10
 ) -> list[dict]:
-    """Extract normalised absolute coefficient importances."""
+    """
+    Extract normalised feature importances.
+
+    Linear models (Logistic, Ridge): use absolute coefficients.
+    Tree models (RandomForest, GradientBoosting): use feature_importances_.
+    Both are normalised to sum to 1 for comparability across model types.
+    """
     try:
-        if hasattr(model, "coef_"):
+        if hasattr(model, "feature_importances_"):
+            # Tree models — Gini/variance-based importances
+            importances = model.feature_importances_
+        elif hasattr(model, "coef_"):
+            # Linear models — absolute coefficients
             coef = np.abs(model.coef_)
             if coef.ndim == 2:
                 coef = coef.mean(axis=0)
             importances = coef
-        elif hasattr(model, "feature_importances_"):
-            importances = model.feature_importances_
         else:
             return []
 
@@ -161,52 +212,41 @@ def _extract_feature_importances(
 # ---------------------------------------------------------------------------
 
 def _compute_shap_values(
-    model,
-    X_train: np.ndarray,
-    feature_names: list[str],
-    task_type: TaskType,
-    top_n: int = 10,
+    model, X_train: np.ndarray, feature_names: list[str],
+    task_type: TaskType, top_n: int = 10,
 ) -> list[dict]:
     """
-    Compute mean absolute SHAP values using LinearExplainer.
+    Compute mean absolute SHAP values.
 
-    Why LinearExplainer?
-      For linear models (LogisticRegression, Ridge), LinearExplainer
-      computes exact SHAP values analytically — no sampling, no
-      approximation. It is fast even on 120k rows because it uses
-      the training data mean as the background.
-
-    Why SHAP over coefficients?
-      Coefficients are scale-dependent and assume feature independence.
-      SHAP values are scale-independent and account for the correlation
-      structure of the training data. They are also directly interpretable:
-      a SHAP value of 0.05 means that feature increased the prediction
-      by 0.05 on average.
-
-    Returns top_n features sorted by mean absolute SHAP value descending.
+    Uses the appropriate explainer for each model type:
+      Linear models  -> LinearExplainer (exact, fast)
+      Tree models    -> TreeExplainer (exact for trees, fast)
     """
     try:
         import shap
 
-        # Use a sample for speed — 5k rows is sufficient for stable mean SHAP
         sample_size = min(5000, X_train.shape[0])
         rng = np.random.default_rng(seed=RANDOM_STATE)
         idx = rng.choice(X_train.shape[0], size=sample_size, replace=False)
         X_sample = X_train[idx]
 
-        explainer = shap.LinearExplainer(model, X_sample)
-        shap_values = explainer.shap_values(X_sample)
+        # Pick the right explainer for the model type
+        if hasattr(model, "feature_importances_"):
+            # Tree-based models — TreeExplainer is exact and fast
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_sample)
+        else:
+            # Linear models — LinearExplainer is exact
+            explainer = shap.LinearExplainer(model, X_sample)
+            shap_values = explainer.shap_values(X_sample)
 
-        # For binary classification, shap_values is a 2D array (n_samples, n_features)
+        # Handle multiclass / binary outputs
         if isinstance(shap_values, list):
-            # Multiclass: list of arrays, one per class — take mean across classes
             shap_values = np.mean([np.abs(sv) for sv in shap_values], axis=0)
         else:
             shap_values = np.abs(shap_values)
 
         mean_shap = shap_values.mean(axis=0)
-
-        # Normalise
         total = mean_shap.sum()
         if total > 0:
             mean_shap = mean_shap / total
@@ -216,7 +256,6 @@ def _compute_shap_values(
             key=lambda x: x[1],
             reverse=True,
         )
-
         return [
             {"feature": feat, "shap_importance": round(float(val), 4)}
             for feat, val in paired[:top_n]
@@ -235,15 +274,16 @@ def model_node(state: AnalyticsState) -> dict:
     """
     Baseline model node.
 
-    Loads processed splits, trains the algorithm, runs CV,
-    computes both coefficient importances and SHAP values,
-    serialises the model.
+    Reads the model recommendation from scoped_problem, trains the
+    appropriate algorithm, runs cross-validation, computes SHAP values,
+    and serialises the model.
     """
     console.rule("[bold]Node 4: Baseline Model[/bold]")
 
     scoped_problem = state["scoped_problem"]
     etl_artifacts = state["etl_artifacts"]
     task_type = scoped_problem.task_type
+    recommendation = scoped_problem.model_recommendation
 
     # --- Load splits ---
     splits_df = pd.read_csv(etl_artifacts.processed_data_path)
@@ -252,8 +292,6 @@ def model_node(state: AnalyticsState) -> dict:
 
     drop_cols = ["__split__", "__target__"]
     raw_feature_cols = [c for c in splits_df.columns if c not in drop_cols]
-
-    # Clean feature names — strip "numeric__" / "categorical__" prefixes
     clean_feature_cols = _clean_feature_names(raw_feature_cols)
 
     X_train = train_df[raw_feature_cols].values
@@ -263,13 +301,14 @@ def model_node(state: AnalyticsState) -> dict:
 
     console.print(f"  Train: {X_train.shape} | Test: {X_test.shape}")
 
-    # --- Algorithm and scorer ---
-    algorithm = _get_algorithm(task_type)
+    # --- Algorithm selection ---
+    algorithm = _get_algorithm(task_type, recommendation)
     scorer = _get_cv_scorer(task_type)
     cv_splitter = _get_cv_splitter(task_type, N_CV_FOLDS)
 
-    console.print(f"  Algorithm : {algorithm.__class__.__name__}")
-    console.print(f"  Scorer    : {scorer}")
+    console.print(f"  Algorithm   : {algorithm.__class__.__name__}")
+    console.print(f"  Recommended : {recommendation.value}")
+    console.print(f"  Scorer      : {scorer}")
 
     # --- Cross-validation ---
     console.print(f"  Running {N_CV_FOLDS}-fold cross-validation...")
@@ -300,7 +339,7 @@ def model_node(state: AnalyticsState) -> dict:
 
     console.print(f"  Test {scorer}: {test_score:.4f}")
 
-    # --- Coefficient importances (using clean names) ---
+    # --- Coefficient/tree importances ---
     feature_importances = _extract_feature_importances(
         model=algorithm,
         feature_names=clean_feature_cols,
@@ -327,32 +366,34 @@ def model_node(state: AnalyticsState) -> dict:
         )
 
     # --- Training notes ---
-    training_notes = []
+    training_notes = [f"Model selected by scoping LLM: {recommendation.value}"]
     if task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
-        training_notes.append(
-            "class_weight='balanced' applied — loss rescaled by class frequency."
-        )
+        if recommendation in (
+            ModelRecommendation.LOGISTIC_REGRESSION,
+            ModelRecommendation.RANDOM_FOREST,
+        ):
+            training_notes.append(
+                "class_weight='balanced' applied — handles class imbalance."
+            )
     if cv_std > 0.05:
         training_notes.append(
-            f"High CV variance (std={cv_std:.3f}) — performance unstable across folds."
+            f"High CV variance (std={cv_std:.3f}) — performance unstable."
         )
 
-    # Save SHAP values alongside model for dashboard use
+    # Save SHAP values to disk
     shap_path = settings.models_dir / "shap_values.json"
     shap_path.write_text(
         json.dumps(shap_importances, indent=2), encoding="utf-8"
     )
 
-    # --- Serialise model ---
+    # Serialise model
     model_path = settings.models_dir / "model.joblib"
     joblib.dump(algorithm, model_path)
     console.print(f"  Model saved to: {model_path}")
     console.print("  [green]Model training complete.[/green]")
 
-    # Store SHAP importances in feature_importances field
-    # (we use SHAP as the primary importance metric going forward)
+    # Use SHAP importances as primary, fall back to coefficient importances
     final_importances = shap_importances if shap_importances else feature_importances
-    # Convert shap_importance key to importance key for schema compatibility
     final_importances = [
         {
             "feature": item.get("feature"),

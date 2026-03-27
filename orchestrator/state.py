@@ -38,6 +38,31 @@ class TaskType(str, Enum):
     REGRESSION = "regression"
 
 
+
+class ModelRecommendation(str, Enum):
+    """
+    The model algorithm recommended by the scoping LLM.
+
+    Why an Enum?
+    The LLM cannot invent a model name — it must pick from this list.
+    This maps directly to a real sklearn estimator in model.py, making
+    the recommendation deterministic and auditable.
+
+    Selection guidance (documented here so the prompt and code agree):
+      LOGISTIC_REGRESSION  — linear relationships, need interpretability,
+                             large datasets (>50k rows), binary/multiclass
+      RANDOM_FOREST        — non-linear relationships, mixed feature types,
+                             medium datasets (1k-100k rows), handles nulls
+      GRADIENT_BOOSTING    — best predictive performance, handles imbalance
+                             well, medium datasets, when accuracy > speed
+      RIDGE                — regression tasks only, linear relationships,
+                             correlated features (L2 regularisation helps)
+    """
+    LOGISTIC_REGRESSION = "logistic_regression"
+    RANDOM_FOREST = "random_forest"
+    GRADIENT_BOOSTING = "gradient_boosting"
+    RIDGE = "ridge"
+
 class ColumnType(str, Enum):
     """
     Inferred semantic type of a dataset column.
@@ -86,6 +111,16 @@ class ScopedProblem(BaseModel):
     )
     problem_statement: str = Field(
         description="One or two sentences restating the business problem in precise, testable terms."
+    )
+    model_recommendation: ModelRecommendation = Field(
+        default=ModelRecommendation.LOGISTIC_REGRESSION,
+        description=(
+            "The recommended baseline algorithm based on the task type and data. "
+            "logistic_regression: interpretable, large datasets, linear problems. "
+            "random_forest: non-linear, mixed features, medium datasets. "
+            "gradient_boosting: best accuracy, handles imbalance, medium datasets. "
+            "ridge: regression only, correlated features."
+        )
     )
     features_to_exclude: list[str] = Field(
         default_factory=list,
