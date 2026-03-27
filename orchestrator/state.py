@@ -16,7 +16,7 @@ Reading this file alone should give a complete picture of the system's data cont
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
@@ -68,14 +68,8 @@ class ScopedProblem(BaseModel):
 
     This model is the contract every other node checks against. For example:
     - The model node checks task_type to choose the right algorithm.
-    - The QA node checks that primary_metric matches the one used in ModelResults.
+    - The QA node checks that model_metric matches the one used in ModelResults.
     - The review node checks that limitations are non-empty.
-
-    Example for credit risk:
-    - target_column: "SeriousDlqin2yrs"
-    - task_type: TaskType.BINARY_CLASSIFICATION
-    - success_metric: "roc_auc"
-    - features_to_exclude: [] (no ID column in this dataset)
     """
     target_column: str = Field(
         description="The exact column name in the dataset to be predicted."
@@ -140,17 +134,8 @@ class DataProfile(BaseModel):
 
     Why deterministic?
     Data facts must never come from an LLM. Null rates, distributions,
-    and correlations are computed directly with pandas and stored here.
+    and correlations are computed by pandas/ydata-profiling and stored here.
     The review node can then quote these numbers knowing they are ground truth.
-
-    Implementation note:
-    We use pandas directly instead of ydata-profiling to avoid dependency
-    conflicts on Python 3.12+. The profiling node computes:
-      null rates          -> df.isnull().mean()
-      unique counts       -> df.nunique()
-      distributions       -> df.describe() + value_counts()
-      correlations        -> df.corr()[target].abs().sort_values()
-      quality warnings    -> custom logic (imbalance, high nulls, cardinality)
     """
     n_rows: int = Field(gt=0)
     n_columns: int = Field(gt=0)
@@ -170,7 +155,7 @@ class DataProfile(BaseModel):
             "For regression: {'mean': x, 'std': y, 'min': z, 'max': w}."
         )
     )
-    top_correlations: list[dict[str, float]] = Field(
+    top_correlations: list[dict[str, Any]] = Field(
         default_factory=list,
         description=(
             "Top 5 absolute correlations with the target column. "
@@ -180,14 +165,13 @@ class DataProfile(BaseModel):
     quality_warnings: list[str] = Field(
         default_factory=list,
         description=(
-            "Human-readable warnings: e.g. "
-            "'MonthlyIncome has 19.8% missing values', "
-            "'Class imbalance detected: 93.3% negative class'."
+            "Human-readable warnings: e.g. 'Column tenure has 34% missing values', "
+            "'Class imbalance detected: 91% negative class'."
         )
     )
     profile_report_path: Optional[str] = Field(
         default=None,
-        description="Reserved for future use. Always None in current implementation."
+        description="Path to the full ydata-profiling HTML report, if generated."
     )
 
 
@@ -216,8 +200,7 @@ class ETLArtifacts(BaseModel):
         description=(
             "Human-readable description of each pipeline step in order. "
             "e.g. ['SimpleImputer(strategy=median) on numeric columns', "
-            "'StandardScaler on numeric columns'] — "
-            "no categorical columns in Give Me Some Credit dataset."
+            "'OneHotEncoder on categorical columns', 'StandardScaler']"
         )
     )
     n_rows_after_cleaning: int = Field(gt=0)
