@@ -28,6 +28,7 @@ _STAGE_ORDER = {
     ResumeFrom.SCOPING: 0,
     ResumeFrom.ETL: 1,
     ResumeFrom.MODEL: 2,
+    ResumeFrom.DASHBOARD: 3,
 }
 
 _METRIC_ALIASES = {
@@ -38,6 +39,61 @@ _METRIC_ALIASES = {
     "rmse": ["rmse", "root mean squared error"],
     "mae": ["mae", "mean absolute error"],
 }
+
+_DASHBOARD_RULES = [
+    (
+        ["confusion matrix", "confusion heatmap"],
+        "Add a confusion matrix on the held-out test split for classification tasks.",
+    ),
+    (
+        ["roc curve", "auc curve"],
+        "Add an ROC curve on the held-out test split for binary classification when probabilities are available.",
+    ),
+    (
+        ["precision recall curve", "precision-recall curve", "pr curve"],
+        "Add a precision-recall curve on the held-out test split for classification when probabilities are available.",
+    ),
+    (
+        ["calibration plot", "calibration curve"],
+        "Add a calibration plot when the model exposes probabilities.",
+    ),
+    (
+        ["feature importance", "important features", "top features", "top drivers"],
+        "Highlight the most important features in a dedicated dashboard section.",
+    ),
+    (
+        ["executive summary", "business summary", "business-friendly", "stakeholder-friendly", "non-technical"],
+        "Add a plain-English executive summary aimed at business stakeholders.",
+    ),
+    (
+        ["limitations", "caveats"],
+        "Surface model limitations clearly in the dashboard.",
+    ),
+    (
+        ["recommendation", "recommendations", "next steps"],
+        "Add a recommendations or next-steps section grounded in the current results.",
+    ),
+    (
+        ["layout", "cleaner layout", "improve layout"],
+        "Improve the dashboard layout and section ordering for readability.",
+    ),
+    (
+        ["class balance", "class distribution"],
+        "Add a class-balance view using the available target data.",
+    ),
+]
+
+_DASHBOARD_CONTEXT_TERMS = [
+    "dashboard",
+    "streamlit",
+    "app",
+    "chart",
+    "plot",
+    "visual",
+    "visualization",
+    "layout",
+    "summary",
+]
 
 
 def _choose_earliest_resume(
@@ -50,9 +106,16 @@ def _choose_earliest_resume(
 
 
 def _extract_first_int(text: str) -> Optional[int]:
-    match = re.search(r"\b(\d+)\b", text)
+    match = re.search(r"(\d+)", text)
     if match:
         return int(match.group(1))
+    return None
+
+
+def _extract_first_float(text: str) -> Optional[float]:
+    match = re.search(r"(\d+(?:\.\d+)?)", text)
+    if match:
+        return float(match.group(1))
     return None
 
 
@@ -77,6 +140,11 @@ def _extract_explicit_columns(feedback: str, candidate_columns: list[str]) -> li
     return ordered
 
 
+def _append_dashboard_request(action: FeedbackAction, request: str) -> None:
+    if request not in action.dashboard_requests:
+        action.dashboard_requests.append(request)
+
+
 def parse_human_feedback(feedback: str, state: AnalyticsState) -> FeedbackAction:
     """
     Parse free-text human feedback into a deterministic action plan.
@@ -87,6 +155,7 @@ def parse_human_feedback(feedback: str, state: AnalyticsState) -> FeedbackAction
       - exclude explicit columns mentioned by name
       - switch model algorithm
       - change primary metric
+      - add dashboard-only requests like confusion matrix / executive summary
       - fallback to re-scope when feedback is broad or ambiguous
     """
     text = (feedback or "").strip().lower()
@@ -110,45 +179,36 @@ def parse_human_feedback(feedback: str, state: AnalyticsState) -> FeedbackAction
         rationale_parts.append(reason)
 
     # ------------------------------------------------------------------
-    # Feature-selection feedback
+    # Feature-selection changes
     # ------------------------------------------------------------------
     if any(phrase in text for phrase in [
         "fewer features",
         "reduce features",
         "too many features",
         "simpler feature set",
-        "try fewer predictors",
-        "use fewer columns",
-        "reduce the number of features",
+        "use fewer variables",
     ]):
         action.set_feature_selection_strategy = FeatureSelectionStrategy.SELECT_K_BEST
-        inferred_k = _extract_first_int(text)
-        if inferred_k is not None:
-            action.set_feature_selection_k = inferred_k
-            mark(ResumeFrom.ETL, f"feature reduction requested (k={inferred_k})")
-        else:
-            mark(ResumeFrom.ETL, "feature reduction requested")
+        requested_k = _extract_first_int(text)
+        if requested_k is not None:
+            action.set_feature_selection_k = requested_k
+        mark(ResumeFrom.ETL, "reduce numeric features with SelectKBest")
 
-    if any(phrase in text for phrase in [
-        "correlation filter",
-        "correlation-based",
-        "correlation based",
-        "filter by correlation",
-    ]):
+    if "correlation filter" in text or "correlation-based" in text:
         action.set_feature_selection_strategy = FeatureSelectionStrategy.CORRELATION_FILTER
-        maybe_threshold = re.search(r"(?:threshold|corr(?:elation)?)\s*[=:]?\s*(0?\.\d+|1\.0|1)", text)
-        if maybe_threshold:
-            action.set_feature_selection_threshold = float(maybe_threshold.group(1))
-            mark(ResumeFrom.ETL, f"correlation filter requested (threshold={maybe_threshold.group(1)})")
-        else:
-            mark(ResumeFrom.ETL, "correlation filter requested")
+        threshold = _extract_first_float(text)
+        if threshold is not None and threshold <= 1.0:
+            action.set_feature_selection_threshold = threshold
+        mark(ResumeFrom.ETL, "use correlation-based numeric feature filtering")
 
     # ------------------------------------------------------------------
-    # Explicit column exclusions
+    # Explicit feature exclusions
     # ------------------------------------------------------------------
-    if any(keyword in text for keyword in ["drop ", "exclude ", "remove ", "ignore "]):
-        mentioned_columns = _extract_explicit_columns(text, candidate_columns)
-        protected_columns = {scoped_problem.target_column} if scoped_problem is not None else set()
+    if any(token in text for token in ["drop ", "exclude ", "remove "]):
+        mentioned_columns = _extract_explicit_columns(feedback, candidate_columns)
+        protected_columns = set()
+        if scoped_problem is not None:
+            protected_columns.add(scoped_problem.target_column)
         explicit_exclusions = [col for col in mentioned_columns if col not in protected_columns]
         if explicit_exclusions:
             action.add_features_to_exclude.extend(explicit_exclusions)
@@ -178,6 +238,22 @@ def parse_human_feedback(feedback: str, state: AnalyticsState) -> FeedbackAction
             action.set_success_metric = metric
             mark(ResumeFrom.MODEL, f"change success metric to {metric}")
             break
+
+    # ------------------------------------------------------------------
+    # Dashboard-only changes
+    # ------------------------------------------------------------------
+    matched_dashboard_rule = False
+    for aliases, request in _DASHBOARD_RULES:
+        if any(alias in text for alias in aliases):
+            _append_dashboard_request(action, request)
+            matched_dashboard_rule = True
+
+    if matched_dashboard_rule:
+        mark(ResumeFrom.DASHBOARD, "dashboard-specific review requests detected")
+
+    if any(term in text for term in _DASHBOARD_CONTEXT_TERMS) and not matched_dashboard_rule:
+        _append_dashboard_request(action, feedback.strip())
+        mark(ResumeFrom.DASHBOARD, "generic dashboard/app feedback detected")
 
     # ------------------------------------------------------------------
     # Re-scope triggers

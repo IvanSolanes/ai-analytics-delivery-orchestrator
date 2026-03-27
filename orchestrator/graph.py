@@ -94,11 +94,18 @@ def inject_human_feedback(state: AnalyticsState) -> dict:
     action = parse_human_feedback(feedback, state)
     console.print(f"  Parsed feedback action: {action.rationale}")
 
+    existing_dashboard_requests = list(state.get("dashboard_requests", []))
+    merged_dashboard_requests = existing_dashboard_requests.copy()
+    for request in action.dashboard_requests:
+        if request not in merged_dashboard_requests:
+            merged_dashboard_requests.append(request)
+
     updates: dict = {
         "human_feedback": None,
         "retry_count": 0,
         "feedback_action": action,
         "resume_from": action.resume_from,
+        "dashboard_requests": merged_dashboard_requests,
     }
 
     scoped_problem = state.get("scoped_problem")
@@ -190,6 +197,7 @@ def build_graph():
             ResumeFrom.SCOPING.value: "scoping_node",
             ResumeFrom.ETL.value: "etl_node",
             ResumeFrom.MODEL.value: "model_node",
+            ResumeFrom.DASHBOARD.value: "dashboard_node",
         },
     )
     workflow.add_edge("qa_node", END)

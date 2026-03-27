@@ -90,6 +90,7 @@ class ResumeFrom(str, Enum):
     SCOPING = "scoping_node"
     ETL = "etl_node"
     MODEL = "model_node"
+    DASHBOARD = "dashboard_node"
 
 
 # =============================================================================
@@ -463,6 +464,13 @@ class FeedbackAction(BaseModel):
         le=1.0,
         description="Override for feature_selection_threshold when using correlation_filter.",
     )
+    dashboard_requests: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Normalized dashboard-only reviewer requests that should be carried "
+            "into the dashboard node on the next run."
+        ),
+    )
     rationale: str = Field(
         default="",
         description="Short explanation of which rules fired during parsing.",
@@ -573,6 +581,7 @@ class AnalyticsState(TypedDict, total=False):
       review_scores       -> review node
       human_feedback      -> human review interrupt
       feedback_action     -> feedback parser
+      dashboard_requests  -> feedback parser + dashboard regeneration context
       resume_from         -> graph routing logic after human feedback
       qa_result           -> qa node
       final_report        -> qa node (assembles delivery)
@@ -595,6 +604,7 @@ class AnalyticsState(TypedDict, total=False):
     retry_count: int               # Incremented by the graph router on each retry
     human_feedback: Optional[str]  # Set at the human review interrupt; None = approved
     feedback_action: FeedbackAction
+    dashboard_requests: list[str]
     resume_from: ResumeFrom
 
     # --- Final output ---

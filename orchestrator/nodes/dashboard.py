@@ -9,29 +9,31 @@ Responsibility:
 
 Why LLM here?
   Writing Streamlit boilerplate from a structured context is exactly where
-  an LLM adds value — it handles layout, formatting, and code structure
-  from a specification, freeing us from templating logic.
+  an LLM adds value — it handles layout, formatting, and code structure from
+  a specification, freeing us from templating logic.
 
 Why NOT LLM for the context?
-  The numbers fed to the LLM — scores, feature names, warnings — come
-  directly from state. The LLM never invents values. It only writes the
-  code that displays them.
+  The numbers fed to the LLM — scores, feature names, warnings, reviewer
+  instructions — come directly from state. The LLM never invents values.
+  It only writes the code that displays them.
 
 Validation layers:
   1. ast.parse() — rejects syntactically invalid Python immediately
   2. Content checks — verifies key sections are present in the output
-  3. If validation fails, we raise a clear error that the review node
-     can catch and trigger a retry
+  3. Optional request checks — verifies some reviewer-requested sections exist
 
 Inputs from state:
   - scoped_problem: ScopedProblem
   - data_profile: DataProfile
   - etl_artifacts: ETLArtifacts
   - model_results: ModelResults
+  - dashboard_requests: list[str] (optional reviewer requests)
 
 Outputs to state:
-  - dashboard_code: str  (raw Streamlit Python code)
+  - dashboard_code: str (raw Streamlit Python code)
 """
+
+from __future__ import annotations
 
 import ast
 from pathlib import Path
@@ -46,7 +48,6 @@ console = Console()
 
 _PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "dashboard.txt"
 
-# Sections that must appear in valid generated dashboard code
 _REQUIRED_SECTIONS = [
     "import streamlit",
     "st.set_page_config",
@@ -55,14 +56,11 @@ _REQUIRED_SECTIONS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Context builder
-# ---------------------------------------------------------------------------
-# Why build context explicitly instead of passing the full state?
-# 1. The LLM only needs what it needs — no noise
-# 2. Every value is stringified and formatted here — the prompt stays clean
-# 3. This function is independently testable
-# ---------------------------------------------------------------------------
+def _format_dashboard_requests(requests: list[str]) -> str:
+    if not requests:
+        return "No additional dashboard review requests."
+    return "\n".join(f" - {request}" for request in requests)
+
 
 def _build_context(state: AnalyticsState) -> dict:
     """
@@ -75,30 +73,23 @@ def _build_context(state: AnalyticsState) -> dict:
     profile = state["data_profile"]
     etl = state["etl_artifacts"]
     model = state["model_results"]
+    dashboard_requests = list(state.get("dashboard_requests", []))
 
-    # Format feature importances as readable lines
     importances_str = "\n".join(
-        f"  {item['feature']}: {item['importance']:.4f}"
+        f" - {item['feature']}: {item['importance']:.4f}"
         for item in model.feature_importances[:10]
-    ) or "  No feature importances available."
+    ) or " No feature importances available."
 
-    # Format quality warnings
     warnings_str = "\n".join(
-        f"  - {w}" for w in profile.quality_warnings
-    ) or "  No warnings."
+        f" - {warning}" for warning in profile.quality_warnings
+    ) or " No warnings."
 
-    # Format limitations
     limitations_str = "\n".join(
-        f"  - {lim}" for lim in scoped.limitations
-    ) or "  No limitations specified."
+        f" - {limitation}" for limitation in scoped.limitations
+    ) or " No limitations specified."
 
-    # Profile summary path for the dashboard to load
     profile_summary_path = profile.profile_report_path or "None"
-
-    # Number of training rows from the splits
-    n_train = int(len(etl.feature_columns) and
-                  model.cv_mean > 0 and
-                  etl.n_rows_after_cleaning * 0.8) or etl.n_rows_after_cleaning
+    n_train = int(etl.n_rows_after_cleaning * 0.8)
 
     return {
         "problem_statement": scoped.problem_statement,
@@ -110,59 +101,67 @@ def _build_context(state: AnalyticsState) -> dict:
         "cv_std": f"{model.cv_std:.4f}",
         "test_score": f"{model.test_score:.4f}",
         "primary_metric": model.primary_metric,
-        "n_train_rows": str(etl.n_rows_after_cleaning),
+        "n_train_rows": str(n_train),
         "n_features": str(len(etl.feature_columns)),
         "feature_importances": importances_str,
         "quality_warnings": warnings_str,
         "limitations": limitations_str,
         "pipeline_path": etl.pipeline_path,
         "model_path": model.model_path,
+        "processed_data_path": etl.processed_data_path,
         "profile_summary_path": profile_summary_path,
+        "dashboard_requests": _format_dashboard_requests(dashboard_requests),
     }
 
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-def _validate_dashboard_code(code: str) -> list[str]:
+def _validate_dashboard_code(code: str, dashboard_requests: list[str] | None = None) -> list[str]:
     """
     Validate generated Streamlit code.
 
     Returns a list of validation errors. Empty list means valid.
 
-    Two checks:
-    1. ast.parse() — syntax validity
-    2. Required section presence — content completeness
+    Checks:
+      1. ast.parse() — syntax validity
+      2. Required section presence — content completeness
+      3. Optional reviewer-request checks for a few concrete asks
     """
     errors = []
 
-    # Check 1: valid Python syntax
     try:
         ast.parse(code)
-    except SyntaxError as e:
-        errors.append(f"SyntaxError: {e}")
-        return errors  # no point checking sections if syntax is broken
+    except SyntaxError as exc:
+        errors.append(f"SyntaxError: {exc}")
+        return errors
 
-    # Check 2: required sections present
     code_lower = code.lower()
     for section in _REQUIRED_SECTIONS:
         if section.lower() not in code_lower:
             errors.append(f"Missing required section: '{section}'")
 
+    requests = [request.lower() for request in (dashboard_requests or [])]
+    wants_confusion_matrix = any("confusion matrix" in request for request in requests)
+    if wants_confusion_matrix:
+        cm_tokens = [
+            "confusion matrix",
+            "confusion_matrix",
+            "confusionmatrixdisplay",
+            "px.imshow",
+            "heatmap",
+        ]
+        if not any(token in code_lower for token in cm_tokens):
+            errors.append(
+                "Reviewer requested a confusion matrix, but no confusion-matrix section was detected."
+            )
+
     return errors
 
-
-# ---------------------------------------------------------------------------
-# The node function
-# ---------------------------------------------------------------------------
 
 def dashboard_node(state: AnalyticsState) -> dict:
     """
     Dashboard generation node.
 
-    Builds a context from prior state, calls the LLM to generate
-    Streamlit code, validates it, and writes it to disk.
+    Builds a context from prior state, calls the LLM to generate Streamlit code,
+    validates it, and writes it to disk.
 
     Returns:
         dict with key "dashboard_code" containing the generated Python code.
@@ -172,52 +171,42 @@ def dashboard_node(state: AnalyticsState) -> dict:
     """
     console.rule("[bold]Node 5: Dashboard Generation[/bold]")
 
-    # --- Step 1: Build the prompt context ---
     context = _build_context(state)
     console.print(f"  Context built: {len(context)} fields")
-    console.print(f"  Algorithm: {context['algorithm']} | "
-                  f"Score: {context['test_score']} | "
-                  f"Features: {context['n_features']}")
+    console.print(
+        f"  Algorithm: {context['algorithm']} | "
+        f"Score: {context['test_score']} | "
+        f"Features: {context['n_features']}"
+    )
+    if state.get("dashboard_requests"):
+        console.print(
+            f"  Reviewer dashboard requests: {len(state['dashboard_requests'])}"
+        )
 
-    # --- Step 2: Load prompt and build chain ---
     template = _PROMPT_PATH.read_text(encoding="utf-8")
     prompt = PromptTemplate(
         input_variables=list(context.keys()),
         template=template,
     )
 
-    # temperature=0.1: slight creativity for layout variety,
-    # but not so high that it invents values or breaks syntax
     llm = get_llm(temperature=0.1)
-
-    # For dashboard generation we want raw text output, not structured JSON.
-    # We use the LLM directly without .with_structured_output() — the
-    # output is Python code, not a Pydantic schema.
     chain = prompt | llm
 
-    # --- Step 3: Call the LLM ---
     console.print("  Calling LLM for dashboard generation...")
     response = chain.invoke(context)
 
-    # Extract content from the AIMessage response object
-    raw_code = (
-        response.content
-        if hasattr(response, "content")
-        else str(response)
-    )
-
-    # Strip any accidental markdown code fences the LLM may add
-    # despite the prompt instruction — defensive cleaning
+    raw_code = response.content if hasattr(response, "content") else str(response)
     raw_code = raw_code.strip()
     if raw_code.startswith("```"):
         lines = raw_code.split("\n")
-        # Remove first line (```python or ```) and last line (```)
         raw_code = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
 
     console.print(f"  Generated {len(raw_code.splitlines())} lines of code")
 
-    # --- Step 4: Validate ---
-    errors = _validate_dashboard_code(raw_code)
+    errors = _validate_dashboard_code(
+        raw_code,
+        dashboard_requests=list(state.get("dashboard_requests", [])),
+    )
     if errors:
         error_summary = "; ".join(errors)
         console.print(f"  [red]Validation failed:[/red] {error_summary}")
@@ -227,11 +216,9 @@ def dashboard_node(state: AnalyticsState) -> dict:
 
     console.print("  [green]Validation passed.[/green]")
 
-    # --- Step 5: Write to disk ---
     dashboard_path = settings.dashboards_dir / "dashboard.py"
     dashboard_path.write_text(raw_code, encoding="utf-8")
     console.print(f"  Dashboard saved to: {dashboard_path}")
     console.print("  [green]Dashboard generation complete.[/green]")
 
     return {"dashboard_code": raw_code}
-    
