@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Any, Optional
+
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
@@ -36,7 +37,6 @@ class TaskType(str, Enum):
     BINARY_CLASSIFICATION = "binary_classification"
     MULTICLASS_CLASSIFICATION = "multiclass_classification"
     REGRESSION = "regression"
-
 
 
 class ModelRecommendation(str, Enum):
@@ -63,6 +63,14 @@ class ModelRecommendation(str, Enum):
     GRADIENT_BOOSTING = "gradient_boosting"
     RIDGE = "ridge"
 
+
+class FeatureSelectionStrategy(str, Enum):
+    """How the ETL node should reduce raw numeric features, if at all."""
+    NONE = "none"
+    SELECT_K_BEST = "select_k_best"
+    CORRELATION_FILTER = "correlation_filter"
+
+
 class ColumnType(str, Enum):
     """
     Inferred semantic type of a dataset column.
@@ -75,6 +83,13 @@ class ColumnType(str, Enum):
     TEXT = "text"
     ID = "id"           # high-cardinality identifier — should be dropped
     TARGET = "target"   # the column being predicted
+
+
+class ResumeFrom(str, Enum):
+    """The earliest graph node that must be rerun after human feedback."""
+    SCOPING = "scoping_node"
+    ETL = "etl_node"
+    MODEL = "model_node"
 
 
 # =============================================================================
@@ -121,6 +136,31 @@ class ScopedProblem(BaseModel):
             "gradient_boosting: best accuracy, handles imbalance, medium datasets. "
             "ridge: regression only, correlated features."
         )
+    )
+    feature_selection_strategy: FeatureSelectionStrategy = Field(
+        default=FeatureSelectionStrategy.NONE,
+        description=(
+            "How numeric features should be reduced before modelling. "
+            "Use 'none' when no reduction is needed, 'select_k_best' for a simpler "
+            "baseline, or 'correlation_filter' for interpretable filtering."
+        ),
+    )
+    feature_selection_k: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Number of numeric features to keep when "
+            "feature_selection_strategy='select_k_best'."
+        ),
+    )
+    feature_selection_threshold: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Absolute correlation threshold when "
+            "feature_selection_strategy='correlation_filter'."
+        ),
     )
     features_to_exclude: list[str] = Field(
         default_factory=list,
@@ -226,10 +266,21 @@ class ETLArtifacts(BaseModel):
     model_results.feature_columns == etl_artifacts.feature_columns.
     """
     feature_columns: list[str] = Field(
-        description="Ordered list of feature column names fed into the pipeline."
+        description="Ordered list of raw feature column names fed into the pipeline."
     )
     target_column: str = Field(
         description="The target column name — must match scoped_problem.target_column."
+    )
+    feature_selection_strategy: FeatureSelectionStrategy = Field(
+        description="The deterministic feature-selection strategy actually applied."
+    )
+    selected_numeric_features: list[str] = Field(
+        default_factory=list,
+        description="Numeric columns retained after feature selection."
+    )
+    dropped_numeric_features: list[str] = Field(
+        default_factory=list,
+        description="Numeric columns removed by feature selection."
     )
     preprocessing_steps: list[str] = Field(
         description=(
@@ -371,6 +422,54 @@ class ReviewScores(BaseModel):
 
 
 # =============================================================================
+# HUMAN FEEDBACK ACTION PLAN
+# Written by: feedback parser (deterministic)
+# =============================================================================
+
+class FeedbackAction(BaseModel):
+    """Structured, deterministic interpretation of human review feedback."""
+    resume_from: ResumeFrom = Field(
+        default=ResumeFrom.SCOPING,
+        description="The earliest node that must rerun for this feedback to take effect.",
+    )
+    update_business_brief: Optional[str] = Field(
+        default=None,
+        description="Revision note appended to the business brief when re-scoping is required.",
+    )
+    set_model_recommendation: Optional[ModelRecommendation] = Field(
+        default=None,
+        description="Override for the scoped baseline model recommendation.",
+    )
+    set_success_metric: Optional[str] = Field(
+        default=None,
+        description="Override for the scoped primary metric.",
+    )
+    add_features_to_exclude: list[str] = Field(
+        default_factory=list,
+        description="Raw columns that should be added to the exclusion list.",
+    )
+    set_feature_selection_strategy: Optional[FeatureSelectionStrategy] = Field(
+        default=None,
+        description="Override for the feature-selection strategy.",
+    )
+    set_feature_selection_k: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Override for feature_selection_k when using select_k_best.",
+    )
+    set_feature_selection_threshold: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Override for feature_selection_threshold when using correlation_filter.",
+    )
+    rationale: str = Field(
+        default="",
+        description="Short explanation of which rules fired during parsing.",
+    )
+
+
+# =============================================================================
 # NODE 8 OUTPUT: QAResult
 # Written by: QA node (deterministic assertions + LLM flag scan)
 # =============================================================================
@@ -473,6 +572,8 @@ class AnalyticsState(TypedDict, total=False):
       dashboard_code      -> dashboard node
       review_scores       -> review node
       human_feedback      -> human review interrupt
+      feedback_action     -> feedback parser
+      resume_from         -> graph routing logic after human feedback
       qa_result           -> qa node
       final_report        -> qa node (assembles delivery)
       retry_count         -> graph routing logic
@@ -491,8 +592,10 @@ class AnalyticsState(TypedDict, total=False):
     review_scores: ReviewScores
 
     # --- Control flow ---
-    retry_count: int              # Incremented by the graph router on each retry
-    human_feedback: Optional[str] # Set at the human review interrupt; None = approved
+    retry_count: int               # Incremented by the graph router on each retry
+    human_feedback: Optional[str]  # Set at the human review interrupt; None = approved
+    feedback_action: FeedbackAction
+    resume_from: ResumeFrom
 
     # --- Final output ---
     qa_result: QAResult

@@ -11,9 +11,9 @@ CRITICAL RULES — follow these exactly:
   Do not invent, rename, or guess a column name.
 - task_type must reflect the nature of the target variable.
 - success_metric must match the task type:
-    binary_classification    -> roc_auc or f1
+    binary_classification     -> roc_auc or f1
     multiclass_classification -> f1_weighted or accuracy
-    regression               -> rmse or mae
+    regression                -> rmse or mae
 - features_to_exclude should include ID columns or leakage-prone columns.
 - limitations must be non-empty and specific to THIS dataset and brief.
 - out_of_scope should state what this analysis will NOT address.
@@ -26,6 +26,20 @@ MODEL RECOMMENDATION — pick one based on these guidelines:
   gradient_boosting    — use when: accuracy is the priority, dataset has
                          class imbalance, medium dataset, non-linear problem
   ridge                — use when: regression task, features may be correlated
+
+FEATURE SELECTION STRATEGY — pick one based on these guidelines:
+  none                 — default when the raw feature set is already modest
+                         or there is no clear reason to reduce it
+  select_k_best        — use when the dataset likely has many numeric predictors
+                         and a simpler baseline with fewer features is preferred
+  correlation_filter   — use when an interpretable numeric filter is useful
+                         and feature relevance can be approximated by correlation
+
+ADDITIONAL FEATURE-SELECTION RULES:
+- If you choose select_k_best, set feature_selection_k to a sensible positive integer.
+- If you choose correlation_filter, optionally set feature_selection_threshold
+  to a value between 0.0 and 1.0; otherwise leave it null.
+- If you choose none, leave feature_selection_k and feature_selection_threshold null.
 
 Business brief:
 {business_brief}

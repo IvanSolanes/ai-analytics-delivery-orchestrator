@@ -19,6 +19,7 @@ from langgraph.graph import END, START, StateGraph
 from rich.console import Console
 
 from orchestrator.config import settings
+from orchestrator.feedback import parse_human_feedback
 from orchestrator.nodes.dashboard import dashboard_node
 from orchestrator.nodes.etl import etl_node
 from orchestrator.nodes.human_review import human_review_node
@@ -27,7 +28,7 @@ from orchestrator.nodes.profiling import profiling_node
 from orchestrator.nodes.qa import qa_node
 from orchestrator.nodes.review import review_node
 from orchestrator.nodes.scoping import scoping_node
-from orchestrator.state import AnalyticsState
+from orchestrator.state import AnalyticsState, ResumeFrom
 
 console = Console()
 
@@ -57,8 +58,18 @@ def route_after_human_review(state: AnalyticsState) -> str:
     if feedback is None:
         console.print("  Routing: approved -> QA")
         return "approved"
-    console.print("  Routing: revision requested -> scoping")
+    console.print("  Routing: revision requested -> inject feedback")
     return "revision_requested"
+
+
+def route_after_feedback_injection(state: AnalyticsState) -> str:
+    resume_from = state.get("resume_from", ResumeFrom.SCOPING)
+    if isinstance(resume_from, ResumeFrom):
+        route = resume_from.value
+    else:
+        route = str(resume_from)
+    console.print(f"  Routing after feedback injection -> {route}")
+    return route
 
 
 # ---------------------------------------------------------------------------
@@ -72,18 +83,60 @@ def increment_retry_count(state: AnalyticsState) -> dict:
 
 
 def inject_human_feedback(state: AnalyticsState) -> dict:
-    feedback = state.get("human_feedback", "")
-    original_brief = state.get("business_brief", "")
-    updated_brief = (
-        f"{original_brief}\n\n"
-        f"[REVISION NOTES FROM HUMAN REVIEW]: {feedback}"
-    )
-    console.print(f"  Injecting feedback into brief ({len(feedback)} chars)")
-    return {
-        "business_brief": updated_brief,
+    feedback = state.get("human_feedback") or ""
+    if not feedback.strip():
+        return {
+            "human_feedback": None,
+            "retry_count": 0,
+            "resume_from": ResumeFrom.SCOPING,
+        }
+
+    action = parse_human_feedback(feedback, state)
+    console.print(f"  Parsed feedback action: {action.rationale}")
+
+    updates: dict = {
         "human_feedback": None,
         "retry_count": 0,
+        "feedback_action": action,
+        "resume_from": action.resume_from,
     }
+
+    scoped_problem = state.get("scoped_problem")
+    if scoped_problem is not None:
+        scoped_problem = scoped_problem.model_copy(deep=True)
+
+        if action.set_model_recommendation is not None:
+            scoped_problem.model_recommendation = action.set_model_recommendation
+
+        if action.set_success_metric is not None:
+            scoped_problem.success_metric = action.set_success_metric
+
+        if action.set_feature_selection_strategy is not None:
+            scoped_problem.feature_selection_strategy = action.set_feature_selection_strategy
+
+        if action.set_feature_selection_k is not None:
+            scoped_problem.feature_selection_k = action.set_feature_selection_k
+
+        if action.set_feature_selection_threshold is not None:
+            scoped_problem.feature_selection_threshold = action.set_feature_selection_threshold
+
+        if action.add_features_to_exclude:
+            scoped_problem.features_to_exclude = sorted(
+                set(scoped_problem.features_to_exclude)
+                | set(action.add_features_to_exclude)
+            )
+
+        updates["scoped_problem"] = scoped_problem
+
+    if action.update_business_brief:
+        original_brief = state.get("business_brief", "")
+        updated_brief = (
+            f"{original_brief}\n\n"
+            f"[REVISION NOTES FROM HUMAN REVIEW]: {action.update_business_brief}"
+        )
+        updates["business_brief"] = updated_brief
+
+    return updates
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +183,15 @@ def build_graph():
             "revision_requested": "inject_feedback",
         },
     )
-    workflow.add_edge("inject_feedback", "scoping_node")
+    workflow.add_conditional_edges(
+        "inject_feedback",
+        route_after_feedback_injection,
+        {
+            ResumeFrom.SCOPING.value: "scoping_node",
+            ResumeFrom.ETL.value: "etl_node",
+            ResumeFrom.MODEL.value: "model_node",
+        },
+    )
     workflow.add_edge("qa_node", END)
 
     checkpointer = MemorySaver()
