@@ -1,0 +1,41 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Runtime outputs
+outputs/
+*.joblib
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+dist/
+build/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data (except the committed sample)
+data/
+!data/credit_risk_sample.csv
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Editors & OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
