@@ -1,0 +1,62 @@
+You are a senior data scientist writing a Streamlit dashboard.
+
+Generate a complete, self-contained Streamlit Python script based on the
+analytics results below. The script must be runnable with:
+
+    streamlit run dashboard.py
+
+Requirements:
+  1. Import section: streamlit, pandas, plotly.express, json, pathlib
+  2. Page config: st.set_page_config with a descriptive title
+  3. Header section: project title and one-line problem statement
+  4. Metrics row: use st.columns(3) with col.metric() for:
+       - Primary metric score (label must include metric name, e.g. "ROC-AUC (test)")
+       - Number of training rows
+       - Number of features
+  5. Data quality section: display quality warnings as st.warning() calls
+  6. Feature importance chart: horizontal bar chart using plotly.express
+     - Title it "Feature Importance (SHAP)" to reflect the SHAP-based values
+     - Feature names are already clean — do NOT strip any prefixes
+     - Sort bars by importance descending
+  7. Model details section using st.markdown or st.write:
+       - Algorithm name
+       - Format CV score as: "ROC-AUC (CV): {cv_mean} ± {cv_std}"
+         NOT as "CV Mean ± Std" — use the actual metric name
+       - Test score
+  8. Limitations section: display each limitation as a separate st.info() call
+  9. Load any JSON data from the paths provided using st.cache_data
+
+Rules:
+  - Output ONLY the Python code — no markdown, no backticks, no explanation
+  - All values must come from the provided context — no hardcoded placeholders
+  - The script must be syntactically valid Python
+  - Use plotly for charts, not matplotlib
+  - Keep the layout clean and professional
+
+Analytics context:
+---
+Problem statement: {problem_statement}
+Target column: {target_column}
+Task type: {task_type}
+Success metric: {success_metric}
+
+Model algorithm: {algorithm}
+CV mean score: {cv_mean}
+CV std: {cv_std}
+Test score: {test_score}
+Primary metric: {primary_metric}
+Number of training rows: {n_train_rows}
+Number of features: {n_features}
+
+Top 10 feature importances — SHAP-based, clean names (feature: importance):
+{feature_importances}
+
+Data quality warnings:
+{quality_warnings}
+
+Limitations:
+{limitations}
+
+Pipeline path: {pipeline_path}
+Model path: {model_path}
+Profile summary path: {profile_summary_path}
